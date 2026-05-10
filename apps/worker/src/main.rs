@@ -39,9 +39,16 @@ async fn main() {
     }
 
     loop {
-        tracing::info!(
-            "worker heartbeat: ready for ingestion, embedding, and long-running agent jobs"
-        );
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("worker received shutdown signal");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                tracing::info!(
+                    "worker heartbeat: ready for ingestion, embedding, and long-running agent jobs"
+                );
+            }
+        }
     }
 }

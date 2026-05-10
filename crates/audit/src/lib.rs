@@ -30,6 +30,8 @@ pub trait AuditLogger: Send + Sync {
     ) -> AppResult<Vec<AuditEvent>>;
 }
 
+const MAX_IN_MEMORY_AUDIT_EVENTS: usize = 10_000;
+
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryAuditLogger {
     events: Arc<RwLock<Vec<AuditEvent>>>,
@@ -57,7 +59,12 @@ impl AuditLogger for InMemoryAuditLogger {
             metadata: input.metadata,
             created_at: Utc::now(),
         };
-        self.events.write().await.push(event.clone());
+        let mut events = self.events.write().await;
+        if events.len() >= MAX_IN_MEMORY_AUDIT_EVENTS {
+            let drain_count = MAX_IN_MEMORY_AUDIT_EVENTS / 10;
+            events.drain(..drain_count);
+        }
+        events.push(event.clone());
         Ok(event)
     }
 

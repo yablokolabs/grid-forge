@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
@@ -71,6 +74,22 @@ impl ApiState {
 }
 
 pub fn build_router(state: ApiState) -> Router {
+    let cors = if state.config.auth.demo_mode {
+        CorsLayer::permissive()
+    } else {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+            ])
+    };
+
     Router::new()
         .route("/health", get(health))
         .route("/auth/login", post(login))
@@ -94,7 +113,8 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
+        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .with_state(state)
 }
 
@@ -280,28 +300,56 @@ async fn process_document(
 ) -> Result<Json<ProcessDocumentResponse>, ApiError> {
     let auth = auth_from_headers(&state, &headers)?;
     auth.require(Permission::IngestDocuments)?;
-    let mut documents = state.documents.write().await;
-    let document = documents
-        .get_mut(&id)
-        .ok_or_else(|| AppError::NotFound(format!("document {id}")))?;
-    document.status = DocumentStatus::Processing;
-    let body = demo_document_body(&document.title);
+
+    // Extract document data under a short-lived write lock (no .await while locked).
+    let (title, source_uri) = {
+        let mut documents = state.documents.write().await;
+        let document = documents
+            .get_mut(&id)
+            .filter(|doc| doc.organization_id == auth.organization_id)
+            .ok_or_else(|| AppError::NotFound(format!("document {id}")))?;
+        document.status = DocumentStatus::Processing;
+        (document.title.clone(), document.source_uri.clone())
+    };
+
+    let body = demo_document_body(&title);
     let fallback;
     let source_text = if body.is_empty() {
         fallback = format!(
             "{}\n\nUploaded source {} is queued for production parser integration.",
-            document.title, document.source_uri
+            title, source_uri
         );
         fallback.as_str()
     } else {
         body
     };
-    let chunks = chunk_text(document, source_text);
+
+    // Re-acquire read lock to build chunks from the document snapshot.
+    let document_snapshot = {
+        let documents = state.documents.read().await;
+        documents
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("document {id}")))?
+    };
+    let chunks = chunk_text(&document_snapshot, source_text);
     let chunks_indexed = chunks.len();
+
+    // Async I/O outside any lock.
     state.vector_store.upsert_chunks(chunks).await?;
-    document.status = DocumentStatus::Indexed;
+
+    // Final status update under a short-lived write lock.
+    let document = {
+        let mut documents = state.documents.write().await;
+        let document = documents
+            .get_mut(&id)
+            .ok_or_else(|| AppError::NotFound(format!("document {id}")))?;
+        document.status = DocumentStatus::Indexed;
+        document.clone()
+    };
+
     Ok(Json(ProcessDocumentResponse {
-        document: document.clone(),
+        document,
         chunks_indexed,
     }))
 }
@@ -317,6 +365,7 @@ async fn get_document(
     let documents = state.documents.read().await;
     let document = documents
         .get(&id)
+        .filter(|doc| doc.organization_id == auth.organization_id)
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("document {id}")))?;
     Ok(Json(document))
