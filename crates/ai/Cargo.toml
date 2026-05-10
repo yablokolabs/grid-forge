@@ -1,0 +1,21 @@
+[package]
+name = "grid-forge-ai"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+grid-forge-common = { path = "../common" }
+grid-forge-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+grid-forge-auth = { path = "../auth" }
